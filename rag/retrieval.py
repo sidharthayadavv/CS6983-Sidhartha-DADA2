@@ -12,6 +12,7 @@ import functools
 import os
 from typing import Literal, Optional
 
+import cohere
 from pydantic import BaseModel, Field
 
 from . import config
@@ -74,13 +75,29 @@ class Filter(BaseModel):
     # TODO 2.1 — three fields. Two of them are optional, and it matters that
     # they are, because plenty of questions name no company at all.
     # your code here
+    ticker: Optional[Literal["NVDA","AMD","MU"]] = Field(
+        default=None,
+        description="What company this question is talking about? identify the ticker if it's specifies about exactly one company."
+    )
+    fiscal_year: Optional[int] = Field(
+        default=None,
+        description="What fiscal year is the question talking about if it only mentions exactly one year?"
+    )
+    search: str = Field(
+        description="What is the subject of this question is looking for?"
+    )
 
 
 def extract_filter(question):
+    """Filter the given question and get the objective of the question 
+    like what is it looking for and if a question specifies about a company 
+    or the fiscal year identify them and fill the Filter class value"""
     # TODO 2.1 — with_structured_output, as in W05b.1. Tell the model to
     # leave company and year empty unless the question names exactly one.
     # your code here
-    raise NotImplementedError
+    model=config.chat().with_structured_output(Filter)
+    query=retry(model.invoke, question)
+    return query
 
 
 def where_of(f):
@@ -92,7 +109,14 @@ def where_of(f):
     """
     # TODO 2.1
     # your code here
-    raise NotImplementedError
+    returnDict={}
+    if f.ticker is not None:
+        returnDict["ticker"]={"$eq":f.ticker}
+    if f.fiscal_year:
+        returnDict["fiscal_year"]={"$eq":f.fiscal_year}
+    if not returnDict:
+        return None
+    return returnDict
 
 
 # --------------------------------------------------------- many queries, fused
@@ -119,13 +143,22 @@ class Queries(BaseModel):
     """Several ways of asking the same thing."""
     # TODO 2.2
     # your code here
+    queries: list[str] = Field(
+        description="Different queries asking the same question goes into this list"
+        )
 
 
 def write_queries(text, n=4):
+    """take the given text and fill the list in Queries class with n number 
+    of queries asking the same question differently. n is given as parameter"""
     # TODO 2.2 — ask the model for n searches that cover the same intent.
     # Return the original text as a single-item list if it gives you nothing.
     # your code here
-    raise NotImplementedError
+    model=config.chat().with_structured_output(Queries)
+    out=retry(model.invoke, text)
+    if not out:
+        return [text] 
+    return out.queries[:n]
 
 
 def rrf(rankings, k=config.RRF_K):
@@ -136,7 +169,16 @@ def rrf(rankings, k=config.RRF_K):
     """
     # TODO 2.2
     # your code here
-    raise NotImplementedError
+    scores = {}
+    for ranking in rankings:
+        for position, doc in enumerate(ranking):
+            contribution = 1 / (k + position + 1)
+            scores[doc] = scores.get(doc, 0) + contribution
+    scores=dict(sorted(scores.items(),key=lambda item: item[1],reverse=True))
+    returnList=[]
+    for item in scores.keys():
+        returnList.append(item)
+    return returnList
 
 
 # --------------------------------------------------------------- the retrieval
@@ -169,7 +211,12 @@ def rerank_cohere(question, passages, top_n):
     # TODO 2.3 — cohere.ClientV2(...).rerank(model="rerank-v3.5", ...).
     # It returns results carrying .index into the list you gave it.
     # your code here
-    raise NotImplementedError
+    result=cohere.ClientV2(
+        os.environ["COHERE_API_KEY"]).rerank(model="rerank-v3.5",
+                                            query=question,
+                                            documents=[text for _, text in passages],
+                                            top_n=top_n)
+    return [passages[r.index] for r in result.results]
 
 
 
@@ -197,13 +244,21 @@ def baseline(question, k=config.K):
 def with_filter(question, k=config.K):
     # TODO 2.1 — extract, then search the filtered index for f.search only.
     # your code here
-    raise NotImplementedError
+    f=extract_filter(question)
+    return dense(f.search, k, where=where_of(f))
 
 
 def filter_rrf(question, k=config.K):
     # TODO 2.2 — one dense search per rewrite, same filter on each, fused.
     # your code here
-    raise NotImplementedError
+    filtered=extract_filter(question)
+    where=where_of(filtered)
+    rankings=[]
+    f=write_queries(filtered.search)
+    for query in f:
+        rankings.append(dense(query, k,where=where))
+    out=rrf(rankings)
+    return out[:k]
 
 
 def filter_rrf_rerank(question, k=config.K):
@@ -211,7 +266,14 @@ def filter_rrf_rerank(question, k=config.K):
     # Note it is the original question that goes to the reranker, not
     # f.search. The cross-encoder reads language, so give it the real one.
     # your code here
-    raise NotImplementedError
+    filtered=extract_filter(question)
+    where=where_of(filtered)
+    rankings=[]
+    f=write_queries(filtered.search)
+    for query in f:
+        rankings.append(dense(query, k, where=where))
+    pool=rrf(rankings)[:config.POOL]
+    return rerank(question,pool,top_n=k)
 
 
 def hybrid_rrf(question, k=config.K):
