@@ -87,13 +87,23 @@ def route(state: RetrievalState) -> dict:
     """
     # TODO 3.1
     # your code here
-    raise NotImplementedError
+    returnDict={}
+    scope, probs=decision.scope(state["question"])
+    returnDict["scope"]=scope
+    if probs[scope]>=SURE:
+        returnDict["strategy"]=START_WITH[scope]
+    else:
+        returnDict["strategy"]=DEFAULT
+    returnDict["decision_calls"]=1
+    return returnDict
 
 def after_route(state: RetrievalState) -> Literal["lookup", "retrieve"]:
     """Figure questions do not go to retrieval at all."""
     # TODO 3.1
     # your code here
-    raise NotImplementedError
+    if state["scope"]=="figure":
+        return "lookup"
+    return "retrieve"
 
 class Fact(BaseModel):
     """Which figure a question asks for."""
@@ -135,7 +145,10 @@ def lookup(state: RetrievalState) -> dict:
     """
     # TODO 3.2
     # your code here
-    raise NotImplementedError
+    namer=config.chat().with_structured_output(Fact)
+    fact=retry(namer.invoke, "Which reported figure does this ask for? "+state["question"])
+    table=financial_fact(fact.ticker, fact.concept)
+    return {"documents": [(f"{fact.ticker}_financials.json", table)], "verdict": "sufficient", "attempts": 1, "chat_calls": 1}
 
 def retrieve(state: RetrievalState) -> dict:
     search = retrieval.STRATEGIES[state["strategy"]]
@@ -160,7 +173,16 @@ def diagnose(state: RetrievalState) -> dict:
     """
     # TODO 3.3
     # your code here
-    raise NotImplementedError
+    returnDict={}
+    verdict, probs=decision.diagnose(state["question"], state["documents"])
+    returnDict["verdict"]=verdict
+    if verdict=="absent":
+        if probs["absent"]<ABSENT_SURE:
+            if state["attempts"]<MAX_ATTEMPTS:
+                returnDict["verdict"]="wrong_words"
+    returnDict["probabilities"]=probs
+    returnDict["decision_calls"]=1
+    return returnDict
 
 def decide(state: RetrievalState) -> Literal["answer", "stronger", "plan"]:
     """Every verdict has one place to go. sufficient and absent both stop.
@@ -168,7 +190,16 @@ def decide(state: RetrievalState) -> Literal["answer", "stronger", "plan"]:
     is none left. And the attempt cap stops everything."""
     # TODO 3.3
     # your code here
-    raise NotImplementedError
+    if state["verdict"] in ["sufficient","absent"]:
+        return "answer"
+    if state["attempts"]>=MAX_ATTEMPTS:
+        return "answer"
+    if state["verdict"]=="incomplete":
+        return "plan"
+    if state["verdict"]=="wrong_words":
+        if state["strategy"] in STRONGER:
+            return "stronger"
+    return "answer"
 
 def stronger(state: RetrievalState) -> dict:
     """Same question, the next search up. STRONGER says which.
@@ -177,7 +208,7 @@ def stronger(state: RetrievalState) -> dict:
     """
     # TODO 3.4
     # your code here
-    raise NotImplementedError
+    return {"strategy": STRONGER[state["strategy"]]}
 
 class Plan(BaseModel):
     """The separate questions a comparative question breaks into."""
@@ -204,7 +235,11 @@ def plan(state: RetrievalState) -> dict:
     """
     # TODO 3.4
     # your code here
-    raise NotImplementedError
+    planner=config.chat().with_structured_output(Plan)
+    covered = ", ".join(sorted({source for source, _ in state["documents"]})) or "nothing"
+    plan_prompt=PLAN_PROMPT.format(question=state["question"],covered=covered)
+    out=retry(planner.invoke, plan_prompt)
+    return {"steps": out.steps,"chat_calls":1}
 
 def execute(state: RetrievalState) -> dict:
     """One filtered search per step. The filter extractor is a chat call each.
@@ -214,7 +249,14 @@ def execute(state: RetrievalState) -> dict:
     """
     # TODO 3.4
     # your code here
-    raise NotImplementedError
+    findings=[]
+    seen=set(state["documents"] or [])
+    for step in state["steps"]:
+        for hit in retrieval.with_filter(step, config.K):
+            if hit not in seen:
+                findings.append(hit)
+                seen.add(hit)
+    return {"documents":findings,"attempts":state["attempts"]+1, "chat_calls":len(state["steps"])}
 
 ANSWER_PROMPT = """Answer the question using only these passages from SEC
 filings. Cite the filing each fact comes from, by its filename in brackets.
@@ -242,7 +284,25 @@ def build_graph():
 
     # TODO 3.4
     # your code here
-    raise NotImplementedError
+    graph=StateGraph(RetrievalState)
+    graph.add_node("retrieve",retrieve)
+    graph.add_node("lookup",lookup)
+    graph.add_node("answer",answer) 
+    graph.add_node("diagnose",diagnose)
+    graph.add_node("stronger",stronger)
+    graph.add_node("plan",plan)
+    graph.add_node("execute",execute)
+    graph.add_node("route",route)
+    graph.add_edge(START,"route")
+    graph.add_conditional_edges("route",after_route)
+    graph.add_edge("retrieve","diagnose")
+    graph.add_conditional_edges("diagnose",decide)
+    graph.add_edge("plan","execute")
+    graph.add_edge("execute","diagnose")
+    graph.add_edge("stronger","retrieve")
+    graph.add_edge("lookup","answer")
+    graph.add_edge("answer",END)
+    return graph.compile()
 
 def run(question):
     """The whole final state, for tracing and for notebook 04's accounting."""
